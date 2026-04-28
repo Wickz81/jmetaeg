@@ -1,0 +1,609 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Planilha de Investimentos2</title>
+
+<style>
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  background: #0a0a0a;
+  overflow: hidden;
+  font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+}
+
+#container {
+  position: relative;
+  width: 100vw;
+  height: 100vh;
+  overflow: hidden;
+}
+
+#map {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 8192px;
+  height: 8192px;
+  transform-origin: 0 0;
+  pointer-events: none;
+  user-select: none;
+  -webkit-user-drag: none;
+  will-change: transform;
+}
+
+#canvas {
+  position: absolute;
+  top: 0;
+  left: 0;
+  cursor: crosshair;
+}
+
+#loading {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  color: #888;
+  font-size: 14px;
+  z-index: 100;
+  pointer-events: none;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+}
+
+#loading .spinner {
+  width: 32px;
+  height: 32px;
+  border: 3px solid #333;
+  border-top-color: #4ade80;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+#loading .progress {
+  color: #4ade80;
+  font-size: 12px;
+}
+
+#info {
+  position: fixed;
+  top: 12px;
+  left: 12px;
+  z-index: 10;
+  background: rgba(0, 0, 0, 0.7);
+  color: #aaa;
+  padding: 8px 14px;
+  border-radius: 6px;
+  font-size: 12px;
+  backdrop-filter: blur(4px);
+  line-height: 1.6;
+}
+
+#info span {
+  color: #4ade80;
+}
+
+#info .hint {
+  color: #666;
+  font-size: 11px;
+}
+
+#quality-badge {
+  position: fixed;
+  bottom: 12px;
+  right: 12px;
+  z-index: 10;
+  background: rgba(0, 0, 0, 0.7);
+  color: #888;
+  padding: 4px 10px;
+  border-radius: 4px;
+  font-size: 11px;
+  backdrop-filter: blur(4px);
+  transition: opacity 0.5s ease;
+}
+
+#quality-badge.hd {
+  color: #4ade80;
+}
+</style>
+</head>
+
+<body>
+
+<div id="loading">
+  <div class="spinner"></div>
+  <div id="loadingText">Carregando mapa...</div>
+  <div class="progress" id="loadProgress"></div>
+</div>
+
+<div id="info">
+  Zoom: <span id="zoomLevel">100%</span> | Scroll para zoom<br>
+  <span class="hint" id="hint">Clique para marcar o ponto inicial</span>
+</div>
+
+<div id="quality-badge">Carregando...</div>
+
+<div id="container">
+  <img id="map" crossorigin="anonymous" fetchpriority="high" />
+  <canvas id="canvas"></canvas>
+</div>
+
+<script>
+/* ===============================
+   CONFIGURAÇÃO
+================================ */
+const R2_BASE_URL = 'https://pub-c1244f9b36204ddfa14305e1dfa77db7.r2.dev';
+
+const THUMB_URL = R2_BASE_URL + '/mapa-thumb.webp';
+const FULL_URL  = R2_BASE_URL + '/mapa-full.webp';
+
+const IMAGE_SIZE = 8192;
+const METERS_PER_PIXEL = 1;
+
+// Grade
+const GRID_1KM  = 1024;    // 1km = 1024px
+const GRID_100M = 102.4;   // 100m = 102.4px
+
+/* ===============================
+   ELEMENTOS
+================================ */
+const map            = document.getElementById('map');
+const canvas         = document.getElementById('canvas');
+const ctx            = canvas.getContext('2d');
+const loadingEl      = document.getElementById('loading');
+const loadingTextEl  = document.getElementById('loadingText');
+const zoomLevelEl    = document.getElementById('zoomLevel');
+const hintEl         = document.getElementById('hint');
+const loadProgressEl = document.getElementById('loadProgress');
+const qualityBadge   = document.getElementById('quality-badge');
+
+/* ===============================
+   ESTADO
+================================ */
+let scale   = 1;
+let offsetX = 0;
+let offsetY = 0;
+
+let isDragging  = false;
+let wasDragging = false;
+let dragStartX  = 0;
+let dragStartY  = 0;
+
+let pointA     = null;
+let pointB     = null;
+let mouseWorld = null;
+
+let mapReady    = false;
+let needsRedraw = false;
+
+/* ===============================
+   RENDER LOOP
+================================ */
+function scheduleRedraw() {
+  if (!needsRedraw) {
+    needsRedraw = true;
+    requestAnimationFrame(doRedraw);
+  }
+}
+
+function forceRedrawCanvas() {
+  needsRedraw = false;
+  doRedraw();
+}
+
+function doRedraw() {
+  needsRedraw = false;
+  if (!mapReady) return;
+
+  map.style.transform = `translate3d(${offsetX}px, ${offsetY}px, 0) scale(${scale})`;
+
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  // --- GRADE ---
+  drawGrid();
+
+  // --- MEDIÇÃO ---
+  let endPoint = pointB;
+  if (pointA && !pointB && mouseWorld) {
+    endPoint = mouseWorld;
+  }
+
+  if (pointA && endPoint) {
+    const A    = worldToScreen(pointA.x, pointA.y);
+    const B    = worldToScreen(endPoint.x, endPoint.y);
+    const dist = distanceBetween(pointA, endPoint);
+
+    const fontSize  = 14;
+    const dotRadius = 5;
+    const lineWidth = 2;
+    const pad       = 7;
+
+    ctx.strokeStyle = '#ef4444';
+    ctx.lineWidth   = lineWidth;
+    ctx.setLineDash(pointB ? [] : [6, 4]);
+
+    ctx.beginPath();
+    ctx.moveTo(A.x, A.y);
+    ctx.lineTo(B.x, B.y);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    ctx.fillStyle = '#ef4444';
+    ctx.beginPath();
+    ctx.arc(A.x, A.y, dotRadius, 0, Math.PI * 2);
+    ctx.fill();
+
+    if (pointB) {
+      ctx.beginPath();
+      ctx.arc(B.x, B.y, dotRadius, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    const midX = (A.x + B.x) / 2;
+    const midY = (A.y + B.y) / 2;
+    const text = dist + ' m';
+
+    ctx.font = `bold ${fontSize}px Segoe UI`;
+    const w = ctx.measureText(text).width;
+    const h = fontSize + pad;
+
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.8)';
+    ctx.beginPath();
+    roundRect(ctx, midX - w / 2 - pad, midY - h / 2, w + pad * 2, h, 5);
+    ctx.fill();
+
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.15)';
+    ctx.lineWidth   = 1;
+    ctx.beginPath();
+    roundRect(ctx, midX - w / 2 - pad, midY - h / 2, w + pad * 2, h, 5);
+    ctx.stroke();
+
+    ctx.fillStyle    = '#fff';
+    ctx.textAlign    = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(text, midX, midY);
+  }
+
+  if (pointA && !endPoint) {
+    const A = worldToScreen(pointA.x, pointA.y);
+    ctx.fillStyle = '#ef4444';
+    ctx.beginPath();
+    ctx.arc(A.x, A.y, 5, 0, Math.PI * 2);
+    ctx.fill();
+  }
+}
+
+/* ===============================
+   GRADE DO MAPA
+================================ */
+function drawGrid() {
+  const screenW = canvas.width;
+  const screenH = canvas.height;
+
+  // Limites visíveis em coordenadas world
+  const worldLeft   = Math.max(0, (0 - offsetX) / scale);
+  const worldTop    = Math.max(0, (0 - offsetY) / scale);
+  const worldRight  = Math.min(IMAGE_SIZE, (screenW - offsetX) / scale);
+  const worldBottom = Math.min(IMAGE_SIZE, (screenH - offsetY) / scale);
+
+  // --- Linhas de 100m (só se zoom > 25%) ---
+  if (scale > 0.25) {
+    // Opacidade cresce suavemente conforme o zoom aumenta
+    const opacity = Math.min(0.8, (scale - 0.25) * 1.2);
+
+    ctx.strokeStyle = `rgba(255, 255, 255, ${opacity})`;
+    ctx.lineWidth   = 1;
+
+    const startX = Math.floor(worldLeft / GRID_100M) * GRID_100M;
+    const startY = Math.floor(worldTop / GRID_100M) * GRID_100M;
+
+    ctx.beginPath();
+    for (let wx = startX; wx <= worldRight; wx += GRID_100M) {
+      // Pula as linhas de 1km (serão desenhadas depois, mais grossas)
+      if (Math.abs(wx % GRID_1KM) < 1) continue;
+      const sx = wx * scale + offsetX;
+      ctx.moveTo(sx, Math.max(0, worldTop * scale + offsetY));
+      ctx.lineTo(sx, Math.min(screenH, worldBottom * scale + offsetY));
+    }
+    for (let wy = startY; wy <= worldBottom; wy += GRID_100M) {
+      if (Math.abs(wy % GRID_1KM) < 1) continue;
+      const sy = wy * scale + offsetY;
+      ctx.moveTo(Math.max(0, worldLeft * scale + offsetX), sy);
+      ctx.lineTo(Math.min(screenW, worldRight * scale + offsetX), sy);
+    }
+    ctx.stroke();
+  }
+
+  // --- Linhas de 1km (sempre visíveis) ---
+  ctx.strokeStyle = 'rgba(255, 255, 255, 0.35)';
+  ctx.lineWidth   = 1;
+
+  const start1kmX = Math.floor(worldLeft / GRID_1KM) * GRID_1KM;
+  const start1kmY = Math.floor(worldTop / GRID_1KM) * GRID_1KM;
+
+  ctx.beginPath();
+  for (let wx = start1kmX; wx <= worldRight; wx += GRID_1KM) {
+    const sx = wx * scale + offsetX;
+    ctx.moveTo(sx, Math.max(0, worldTop * scale + offsetY));
+    ctx.lineTo(sx, Math.min(screenH, worldBottom * scale + offsetY));
+  }
+  for (let wy = start1kmY; wy <= worldBottom; wy += GRID_1KM) {
+    const sy = wy * scale + offsetY;
+    ctx.moveTo(Math.max(0, worldLeft * scale + offsetX), sy);
+    ctx.lineTo(Math.min(screenW, worldRight * scale + offsetX), sy);
+  }
+  ctx.stroke();
+}
+
+/* ===============================
+   CARREGAMENTO PROGRESSIVO
+================================ */
+function init() {
+  loadProgressEl.textContent = 'Carregando prévia...';
+
+  const thumb = new Image();
+  thumb.crossOrigin = 'anonymous';
+  thumb.src = THUMB_URL;
+
+  thumb.onload = () => {
+    map.src = thumb.src;
+    startApp();
+    qualityBadge.textContent = '📷 Prévia (baixa resolução)';
+
+    const full = new Image();
+    full.crossOrigin = 'anonymous';
+    full.src = FULL_URL;
+
+    full.onload = () => {
+      map.src = full.src;
+      qualityBadge.textContent = '✅ HD carregado';
+      qualityBadge.classList.add('hd');
+      setTimeout(() => { qualityBadge.style.opacity = '0'; }, 3000);
+      scheduleRedraw();
+    };
+
+    full.onerror = () => {
+      qualityBadge.textContent = '⚠️ HD indisponível';
+      setTimeout(() => { qualityBadge.style.opacity = '0'; }, 5000);
+    };
+  };
+
+  thumb.onerror = () => {
+    loadProgressEl.textContent = 'Carregando imagem completa...';
+    const full = new Image();
+    full.crossOrigin = 'anonymous';
+    full.src = FULL_URL;
+
+    full.onload = () => {
+      map.src = full.src;
+      startApp();
+      qualityBadge.textContent = '✅ HD carregado';
+      qualityBadge.classList.add('hd');
+      setTimeout(() => { qualityBadge.style.opacity = '0'; }, 3000);
+    };
+
+    full.onerror = () => {
+      document.querySelector('#loading .spinner').style.display = 'none';
+      loadProgressEl.textContent = '';
+      loadingTextEl.textContent = 'Erro ao carregar o mapa.';
+    };
+  };
+}
+
+/* ===============================
+   INICIAR APP
+================================ */
+function startApp() {
+  if (mapReady) return;
+  mapReady = true;
+
+  loadingEl.style.display = 'none';
+  fitMapToScreen();
+
+  canvas.width  = window.innerWidth;
+  canvas.height = window.innerHeight;
+  scheduleRedraw();
+}
+
+/* ===============================
+   FIT TO SCREEN
+================================ */
+function fitMapToScreen() {
+  const screenW = window.innerWidth;
+  const screenH = window.innerHeight;
+  scale = Math.min(screenW / IMAGE_SIZE, screenH / IMAGE_SIZE);
+  offsetX = (screenW - IMAGE_SIZE * scale) / 2;
+  offsetY = (screenH - IMAGE_SIZE * scale) / 2;
+  zoomLevelEl.textContent = Math.round(scale * 100) + '%';
+}
+
+/* ===============================
+   RESIZE
+================================ */
+window.addEventListener('resize', () => {
+  canvas.width  = window.innerWidth;
+  canvas.height = window.innerHeight;
+  scheduleRedraw();
+});
+
+/* ===============================
+   ABA VOLTOU AO FOCO
+================================ */
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden && mapReady) {
+    map.style.transform = `translate3d(${offsetX}px, ${offsetY}px, 0) scale(${scale})`;
+    forceRedrawCanvas();
+  }
+});
+
+/* ===============================
+   ZOOM
+================================ */
+window.addEventListener('wheel', (e) => {
+  if (!mapReady) return;
+  e.preventDefault();
+  if (isDragging) return;
+
+  const zoomFactor = e.deltaY < 0 ? 1.15 : 0.87;
+  const newScale = Math.max(0.05, Math.min(scale * zoomFactor, 10));
+
+  const rect   = canvas.getBoundingClientRect();
+  const mouseX = e.clientX - rect.left;
+  const mouseY = e.clientY - rect.top;
+
+  const worldX = (mouseX - offsetX) / scale;
+  const worldY = (mouseY - offsetY) / scale;
+
+  offsetX = mouseX - worldX * newScale;
+  offsetY = mouseY - worldY * newScale;
+  scale   = newScale;
+
+  zoomLevelEl.textContent = Math.round(scale * 100) + '%';
+  map.style.transform = `translate3d(${offsetX}px, ${offsetY}px, 0) scale(${scale})`;
+  forceRedrawCanvas();
+}, { passive: false });
+
+/* ===============================
+   PAN
+================================ */
+canvas.addEventListener('mousedown', (e) => {
+  if (!mapReady) return;
+  if (e.button !== 0) return;
+
+  isDragging  = true;
+  wasDragging = false;
+  dragStartX  = e.clientX - offsetX;
+  dragStartY  = e.clientY - offsetY;
+});
+
+window.addEventListener('mousemove', (e) => {
+  if (!mapReady) return;
+
+  const rect = canvas.getBoundingClientRect();
+  mouseWorld = screenToWorld(e.clientX - rect.left, e.clientY - rect.top);
+
+  if (isDragging) {
+    const dx = Math.abs(e.clientX - (dragStartX + offsetX));
+    const dy = Math.abs(e.clientY - (dragStartY + offsetY));
+    if (dx > 3 || dy > 3) wasDragging = true;
+
+    offsetX = e.clientX - dragStartX;
+    offsetY = e.clientY - dragStartY;
+
+    map.style.transform = `translate3d(${offsetX}px, ${offsetY}px, 0) scale(${scale})`;
+    scheduleRedraw();
+  } else if (pointA && !pointB) {
+    scheduleRedraw();
+  }
+});
+
+window.addEventListener('mouseup', () => {
+  isDragging = false;
+});
+
+/* ===============================
+   COORDENADAS
+================================ */
+function screenToWorld(x, y) {
+  return {
+    x: (x - offsetX) / scale,
+    y: (y - offsetY) / scale
+  };
+}
+
+function worldToScreen(x, y) {
+  return {
+    x: x * scale + offsetX,
+    y: y * scale + offsetY
+  };
+}
+
+/* ===============================
+   MEDIÇÃO
+================================ */
+canvas.addEventListener('click', (e) => {
+  if (!mapReady) return;
+  if (wasDragging) return;
+
+  const rect = canvas.getBoundingClientRect();
+  const pos  = screenToWorld(e.clientX - rect.left, e.clientY - rect.top);
+
+  if (pos.x < 0 || pos.x > IMAGE_SIZE || pos.y < 0 || pos.y > IMAGE_SIZE) return;
+
+  if (!pointA && !pointB) {
+    pointA = pos;
+    hintEl.textContent = 'Mova o mouse para medir · Clique para fixar · Direito para cancelar';
+    scheduleRedraw();
+    return;
+  }
+
+  if (pointA && !pointB) {
+    pointB = pos;
+    hintEl.textContent = 'Clique para nova medição';
+    scheduleRedraw();
+    return;
+  }
+
+  pointA = pos;
+  pointB = null;
+  hintEl.textContent = 'Mova o mouse para medir · Clique para fixar · Direito para cancelar';
+  scheduleRedraw();
+});
+
+/* ===============================
+   BOTÃO DIREITO — CANCELA
+================================ */
+canvas.addEventListener('contextmenu', (e) => {
+  e.preventDefault();
+  pointA = null;
+  pointB = null;
+  hintEl.textContent = 'Clique para marcar o ponto inicial';
+  scheduleRedraw();
+});
+
+/* ===============================
+   DISTÂNCIA
+================================ */
+function distanceBetween(a, b) {
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+  return Math.round(Math.sqrt(dx * dx + dy * dy) * METERS_PER_PIXEL);
+}
+
+/* ===============================
+   UTILITÁRIO
+================================ */
+function roundRect(ctx, x, y, w, h, r) {
+  ctx.moveTo(x + r, y);
+  ctx.lineTo(x + w - r, y);
+  ctx.quadraticCurveTo(x + w, y, x + w, y + r);
+  ctx.lineTo(x + w, y + h - r);
+  ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+  ctx.lineTo(x + r, y + h);
+  ctx.quadraticCurveTo(x, y + h, x, y + h - r);
+  ctx.lineTo(x, y + r);
+  ctx.quadraticCurveTo(x, y, x + r, y);
+}
+
+/* ===============================
+   START
+================================ */
+init();
+</script>
+
+</body>
+</html>
